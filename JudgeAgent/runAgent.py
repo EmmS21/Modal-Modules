@@ -15,14 +15,17 @@ from langchain.pydantic_v1 import BaseModel, Field, validator
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, OperationFailure
 
-from google_auth_oauthlib.flow import InstalledAppFlow
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
-import requests
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from urllib.parse import quote_plus
 from typing import List, Optional
+
+import requests
 import json
 import os
-from urllib.parse import quote_plus
+import time
 
 app = modal.App(
     name="JudgeAgent", 
@@ -84,6 +87,15 @@ class KeywordIdeasInput(BaseModel):
     location_ids: Optional[List[str]] = Field(default=None, description="List of location IDs (default is United States)")
 
 def load_prompt() -> str:
+    """
+    Fetches the content of a prompt file from a given URL.
+
+    Returns:
+    - str: The content of the prompt file as a string.
+
+    Raises:
+    - Exception: If the request to fetch the prompt fails.
+    """
     url = "https://raw.githubusercontent.com/EmmS21/Prompts/main/JudgeAgent.md"
     response = requests.get(url)
     if response.status_code == 200:
@@ -94,24 +106,82 @@ def load_prompt() -> str:
 JUDGE_PROMPT = load_prompt()
 
 def map_locations_ids_to_resource_names(client, location_ids):
+    """
+    Maps location IDs to their corresponding resource names using Google Ads API.
+
+    Args:
+    - client: The GoogleAdsClient object.
+    - location_ids (list): A list of location IDs to be mapped.
+
+    Returns:
+    - list: A list of resource names corresponding to the location IDs.
+    """
     build_resource_name = client.get_service("GeoTargetConstantService").geo_target_constant_path
     return [build_resource_name(location_id) for location_id in location_ids]
 
 @app.function(secrets=[modal.Secret.from_name("fractal-demo")])
 def authentication_google():
-    output = {"client_id": os.environ["client_id"],
-              "client_secret": os.environ["client_secret"],
-              "auth_uri": os.environ["auth_uri"],
-              "token_uri": os.environ["token_uri"],
-              "developer_token": os.environ["developer_token"],
-              "use_proto_plus": os.environ["use_proto_plus"],
-              "location_ids":  os.environ["location_ids"],
-              "language_id": os.environ["language_id"],
-              "customer_id": os.environ["customer_id"]
-              }
-    print('**', output)
-    return output
+    """
+    Handles the authentication process for Google Ads API using OAuth2.
 
+    This function supports both refreshing an existing token and performing
+    a new OAuth2 Device Flow if a refresh token is not available.
+
+    Returns:
+    - Credentials: Google OAuth2 credentials for accessing Google Ads API.
+
+    Raises:
+    - Exception: If an error occurs during the OAuth2 Device Flow or token refresh.
+    """
+    client_config = {"client_id": os.environ["client_id"].strip('"'),
+              "client_secret": os.environ["client_secret"].strip('"'),
+              "auth_uri": os.environ["auth_uri"].strip('"'),
+              "token_uri": os.environ["token_uri"].strip('"'),
+              "developer_token": os.environ["developer_token"].strip('"'),
+              "use_proto_plus": os.environ["use_proto_plus"].strip('"'),
+              "location_ids":  os.environ["location_ids"].strip('"'),
+              "language_id": os.environ["language_id"].strip('"'),
+              "customer_id": os.environ["customer_id"].strip('"')
+              }
+    refresh_token = os.getenv("refresh_token")
+    if refresh_token:
+        credentials = Credentials.from_authorized_user_info(
+            {
+                "client_id": client_config["client_id"],
+                "client_secret": client_config["client_secret"],
+                "refresh_token": refresh_token
+            },
+            scopes=['https://www.googleapis.com/auth/adwords']
+        )
+        return credentials
+    if not refresh_token:
+        flow = Flow.from_client_config(
+            {"installed": client_config},
+            scopes=['https://www.googleapis.com/auth/adwords'],
+        )
+        device_flow_info = flow.authorization_url()
+        verification_url = device_flow_info["verification_url"]
+        user_code = device_flow_info["user_code"]
+        interval = device_flow_info["interval"]
+        print(f"Please visit {verification_url} and enter the code: {user_code}")
+        while True:
+            try:
+                flow.fetch_token()
+                credentials = flow.credentials
+                refresh_token = credentials.refresh_token
+                modal.Secret.from_dict({"refresh_token": refresh_token}).persist("fractal-demo")
+                break
+            except Exception:
+                print("Waiting for user to complete authorization...")
+                time.sleep(interval)
+    else:
+        flow = Flow.from_client_config(
+            {"installed": client_config},
+            scopes=['https://www.googleapis.com/auth/adwords'],
+        )
+        credentials = flow.credentials
+        credentials.refresh_token = refresh_token
+    return credentials
 
 @tool("generate_keywords-tool", args_schema=KeywordPlannerInput)
 def generate_keyword_ideas(keywords):
@@ -130,51 +200,32 @@ def generate_keyword_ideas(keywords):
                 - 'text': The keyword text.
                 - 'avg_monthly_searches': Average monthly searches for the keyword.
                 - 'competition': Competition level for the keyword.
+        If an error occurs, the dictionary will contain an 'error' key with details.
     """
-    authentication = authentication_google.remote()
-
-    flow = InstalledAppFlow.from_client_config(
-        client_config={
-            "installed": {
-                "client_id": authentication["client_id"],
-                "client_secret": authentication["client_secret"],
-                "auth_uri": authentication["auth_uri"],
-                "token_uri": authentication["token_uri"]
-            }
-        },
-        scopes=['https://www.googleapis.com/auth/adwords'],
-    )
-    print('step 1')
-    credentials = flow.run_local_server(port=8000)
-    print('step 2')
-            
     try:
+        print("Starting authentication...")
+        authentication = authentication_google.remote()
+
         client = GoogleAdsClient(
-            credentials=credentials,
-            developer_token=authentication["developer_token"],
-            use_proto_plus=authentication["use_proto_plus"]
+            credentials=authentication,  
+            developer_token="KqvZ_dgzuH6zm8foV-7Krw",
+            use_proto_plus=True
         )
-        print('step 3')
         keyword_plan_idea_service = client.get_service("KeywordPlanIdeaService")
         keyword_plan_network = client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH_AND_PARTNERS
-                
-        location_ids = [authentication["location_ids"]]  
-        language_id = authentication["language_id"]
-
+        location_ids = [os.environ["location_ids"].strip('"')]  
+        language_id = os.environ["language_id"].strip('"')
         location_rns = map_locations_ids_to_resource_names(client, location_ids)
         language_rn = client.get_service("GoogleAdsService").language_constant_path(language_id)
-
         request = client.get_type("GenerateKeywordIdeasRequest")
-        request.customer_id = authentication["customer_id"]
+        request.customer_id = os.environ["customer_id"].strip('"')
         request.language = language_rn
         request.geo_target_constants = location_rns
         request.include_adult_keywords = False
         request.keyword_plan_network = keyword_plan_network
         request.keyword_seed.keywords.extend(keywords)
-
         keyword_ideas = keyword_plan_idea_service.generate_keyword_ideas(request=request)
         results = []
-
         for idea in keyword_ideas:
             competition_value = idea.keyword_idea_metrics.competition.name
             avg_monthly_searches = idea.keyword_idea_metrics.avg_monthly_searches
@@ -185,13 +236,13 @@ def generate_keyword_ideas(keywords):
                     "competition": competition_value
                 })
         return {"keyword_ideas": results}
-
     except GoogleAdsException as ex:
-        error_messages = []
-        for error in ex.failure.errors:
-            error_messages.append(f"Error: {error.message}")
-        return {"error": error_messages}
-
+        error_messages = [f"Google Ads API Error: {error.message}" for error in ex.failure.errors]
+        print(f"Google Ads API Error: {error_messages}")
+        return {"error": "Google Ads API Error", "details": error_messages}
+    except Exception as e:
+        print(f"An unexpected error occurred while interacting with the Google Ads API: {str(e)}")
+        return {"error": "Unexpected error during Google Ads API interaction", "details": str(e)}
 
 @tool("validate_ad_length-tool")
 def validate_ad_length(data):
@@ -310,9 +361,18 @@ def encode_credentials(connection_string: str):
     return f"mongodb+srv://{encoded_username}:{encoded_password}@{host}"
 
 
-@app.function(timeout=1200)
+@app.function(timeout=3600)
 @modal.web_endpoint(method="GET")
 def run():
+    """
+    Main function to execute the AI agent workflow. 
+
+    It connects to MongoDB, retrieves marketing data for a business, 
+    and processes it using the AI agent.
+
+    Returns:
+    - str: Final output of the AI agent after processing the input data.
+    """
     mongo_string = os.environ["MONGO"]
     connection_string = encode_credentials(mongo_string)
     connection_string += "&tls=true&tlsVersion=TLS1_2"
@@ -350,15 +410,11 @@ def run():
             "input": input_str,
             "chat_history": []
         }
+        print("Starting AgentExecutor invocation...")
         result = agent_executor.invoke(input_data)
+        print("AgentExecutor invocation completed.")
         if result and "output" in result:
             final_output = result["output"]
             return final_output
     except Exception as e:
         return e
-
-
-
-
-
-

@@ -9,7 +9,7 @@ import os
 import json
 from typing import List, Optional
 import requests
-from modal import App, Image, Secret, web_endpoint, method
+from modal import App, Image, Secret
 import modal
 
 image = Image.debian_slim().pip_install("langchain", "langchain_openai")
@@ -40,8 +40,8 @@ class MarketingResult(BaseModel):
     business: str = Field(
         description="A description of the business for which the marketing materials are being generated."
     )
-    user_persona: str = Field(
-        description="A description of the target user persona for the marketing campaign."
+    user_personas: List[dict] = Field(
+        description="A list of dictionaries, each describing a user persona for the marketing campaign."
     )
 
 class KeywordIdeasInput(BaseModel):
@@ -86,7 +86,7 @@ def multi_on_agent(cmd: str, restart_session: Optional[bool] = False) -> str:
     except requests.RequestException as e:
         return f"An error occurred while calling the MultiOn agent: {str(e)}"
 
-@app.function()
+@app.function(timeout=900)
 @modal.web_endpoint(method="POST")
 def agent(command: Command):
     openai_llm = ChatOpenAI(model="gpt-4o", 
@@ -116,11 +116,11 @@ def agent(command: Command):
             agent_executor = AgentExecutor(
                 agent=agent,
                 tools=tools,
-                verbose=True,
+                verbose=False,
                 handle_parsing_errors=True,
-                max_terations=2000,
-                max_execution_time=189,
-                return_intermediate_steps=True
+                max_terations=10000,
+                max_execution_time=700,
+                return_intermediate_steps=False
             )
             try:
                 result = agent_executor.invoke(input_data)
